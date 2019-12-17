@@ -1,0 +1,20 @@
+{
+  "name": "jspronk-fargate-kvs",
+  "version": "0.1.0",
+  "bin": {
+    "jspronk-fargate-kvs": "bin/jspronk-fargate-kvs.js"
+  },
+  "scripts": {
+    "build": "echo \"The build step is not required when using JavaScript!\" && exit 0",
+    "cdk": "cdk",
+    "test": "jest"
+  },
+  "devDependencies": {
+    "@aws-cdk/assert": "^1.19.0",
+    "aws-cdk": "^1.19.0",
+    "jest": "^24.9.0"
+  },
+  "dependencies": {
+    "@aws-cdk/core": "^1.19.0"
+  }
+}
