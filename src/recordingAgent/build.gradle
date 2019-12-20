@@ -1,0 +1,45 @@
+apply plugin: 'java'
+
+repositories {
+    mavenCentral()
+}
+sourceCompatibility = 1.11
+targetCompatibility = 1.11
+
+dependencies {
+    compile group: 'io.reactivex.rxjava2', name: 'rxjava', version: '2.2.2'
+    compile group: 'org.reactivestreams', name: 'reactive-streams', version: '1.0.3'
+    compile group: 'org.json', name: 'json', version: '20190722'
+    compile group: 'com.fasterxml.jackson.core', name: 'jackson-databind', version: '2.10.0.pr3'
+    compile group: 'com.amazonaws', name: 'amazon-kinesis-video-streams-parser-library', version: '1.0.13'
+    compile(
+            'software.amazon.awssdk:transcribestreaming:2.5.0',
+            'com.amazonaws:aws-java-sdk-sqs:1.11',
+            'com.amazonaws:aws-java-sdk-kinesisvideo:1.11.475',
+            // 'com.amazonaws:aws-java-sdk-cloudwatch:1.11.480',
+            'org.slf4j:slf4j-api:1.7.24',
+            'org.slf4j:slf4j-log4j12:1.7.24',
+
+            // need this for our async clients
+            'software.amazon.awssdk:netty-nio-client:2.2.0',
+
+            // need this for logging
+            'org.apache.commons:commons-lang3:3.6'
+    )
+}
+
+task buildFargate(type: Jar) {
+    from compileJava
+    from processResources
+    manifest {
+        attributes 'Implementation-Title': 'Fargate Task Launchpoint',
+                'Main-Class': 'com.amazonaws.kvsrecorder.SQSProcessor'
+    }
+    from {
+        (configurations.runtime).collect {
+            it.isDirectory() ? it : zipTree(it)
+        }
+    }
+}
+
+build.dependsOn buildFargate

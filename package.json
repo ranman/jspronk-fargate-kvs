@@ -12,9 +12,16 @@
   "devDependencies": {
     "@aws-cdk/assert": "^1.19.0",
     "aws-cdk": "^1.19.0",
-    "jest": "^24.9.0"
+    "jest": "^24.9.0",
+    "prettier": "1.19.1"
   },
   "dependencies": {
+    "@aws-cdk/aws-ec2": "^1.19.0",
+    "@aws-cdk/aws-ecs": "^1.19.0",
+    "@aws-cdk/aws-ecs-patterns": "^1.19.0",
+    "@aws-cdk/aws-iam": "^1.19.0",
+    "@aws-cdk/aws-lambda": "^1.19.0",
+    "@aws-cdk/aws-sqs": "^1.19.0",
     "@aws-cdk/core": "^1.19.0"
   }
 }
