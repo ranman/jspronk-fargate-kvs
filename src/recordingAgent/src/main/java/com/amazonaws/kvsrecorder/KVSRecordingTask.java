@@ -3,14 +3,19 @@ package com.amazonaws.kvsrecorder;
 import com.amazonaws.auth.AWSCredentialsProvider;
 import com.amazonaws.auth.DefaultAWSCredentialsProviderChain;
 import com.amazonaws.kinesisvideo.parser.ebml.InputStreamParserByteSource;
+import com.amazonaws.kinesisvideo.parser.ebml.MkvTypeInfos;
+import com.amazonaws.kinesisvideo.parser.mkv.Frame;
+import com.amazonaws.kinesisvideo.parser.mkv.MkvDataElement;
+import com.amazonaws.kinesisvideo.parser.mkv.MkvElement;
+import com.amazonaws.kinesisvideo.parser.mkv.MkvElementVisitException;
+import com.amazonaws.kinesisvideo.parser.mkv.MkvStartMasterElement;
 import com.amazonaws.kinesisvideo.parser.mkv.StreamingMkvReader;
 import com.amazonaws.kinesisvideo.parser.utilities.FragmentMetadataVisitor;
+import com.amazonaws.kinesisvideo.parser.utilities.MkvTag;
+import com.amazonaws.kinesisvideo.parser.utilities.MkvTrackMetadata;
 import com.amazonaws.regions.Regions;
-import org.reactivestreams.Publisher;
-import org.reactivestreams.Subscriber;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import software.amazon.awssdk.services.transcribestreaming.model.AudioStream;
 
 import java.io.*;
 import java.nio.ByteBuffer;
@@ -19,7 +24,10 @@ import java.nio.file.Paths;
 import java.text.DateFormat;
 import java.text.SimpleDateFormat;
 import java.util.Date;
+import java.util.Iterator;
+import java.util.Map;
 import java.util.Optional;
+import java.util.HashMap;
 
 public class KVSRecordingTask {
 
@@ -66,33 +74,31 @@ public class KVSRecordingTask {
                                                boolean isStreamAudioFromCustomerEnabled, boolean isStreamAudioToCustomerEnabled) throws Exception {
         String streamName = streamARN.substring(streamARN.indexOf("/") + 1, streamARN.lastIndexOf("/"));
 
-        KVSStreamTrackObject kvsStreamTrackObjectFromCustomer = null;
-        KVSStreamTrackObject kvsStreamTrackObjectToCustomer = null;
+        Map<String, KVSStreamTrackObject> outputStreamMap = new HashMap<>();
 
         if (isStreamAudioFromCustomerEnabled) {
-            kvsStreamTrackObjectFromCustomer = getKVSStreamTrackObject(streamName, startFragmentNum, KVSUtils.TrackName.AUDIO_FROM_CUSTOMER.getName(), contactId);
+            KVSStreamTrackObject fromCustomer = getKVSStreamTrackObject(KVSUtils.TrackName.AUDIO_FROM_CUSTOMER.getName(), contactId);
+            outputStreamMap.put(KVSUtils.TrackName.AUDIO_FROM_CUSTOMER.getName(), fromCustomer);
         }
         if (isStreamAudioToCustomerEnabled) {
-            kvsStreamTrackObjectToCustomer = getKVSStreamTrackObject(streamName, startFragmentNum, KVSUtils.TrackName.AUDIO_TO_CUSTOMER.getName(), contactId);
+            KVSStreamTrackObject toCustomer = getKVSStreamTrackObject(KVSUtils.TrackName.AUDIO_TO_CUSTOMER.getName(), contactId);
+            outputStreamMap.put(KVSUtils.TrackName.AUDIO_TO_CUSTOMER.getName(), toCustomer);
         }
         try {
             logger.info("Saving audio bytes to location");
 
             //Write audio bytes from the KVS stream to the temporary file
-            if (kvsStreamTrackObjectFromCustomer != null) {
-                writeAudioBytesToKvsStream(kvsStreamTrackObjectFromCustomer, contactId);
-            }
-            if (kvsStreamTrackObjectToCustomer != null) {
-                writeAudioBytesToKvsStream(kvsStreamTrackObjectToCustomer, contactId);
-            }
+            startStreamingInternal(outputStreamMap, streamName, startFragmentNum, contactId);
 
         } finally {
-            if (kvsStreamTrackObjectFromCustomer != null) {
-                closeFileAndUploadRawAudio(kvsStreamTrackObjectFromCustomer, contactId, saveCallRecording);
-            }
-            if (kvsStreamTrackObjectToCustomer != null) {
-                closeFileAndUploadRawAudio(kvsStreamTrackObjectToCustomer, contactId, saveCallRecording);
-            }
+
+            outputStreamMap.forEach((key, kvsTrackObject) -> {
+                try {
+                    closeFileAndUploadRawAudio(kvsTrackObject, contactId, saveCallRecording);
+                } catch (IOException e) {
+                    logger.error("Failed to upload {} for contactId {}", key, contactId);
+                }
+            });
         }
     }
 
@@ -106,8 +112,11 @@ public class KVSRecordingTask {
      */
     private void closeFileAndUploadRawAudio(KVSStreamTrackObject kvsStreamTrackObject, String contactId, Optional<Boolean> saveCallRecording) throws IOException {
 
-        kvsStreamTrackObject.getInputStream().close();
-        kvsStreamTrackObject.getOutputStream().close();
+        try {
+            kvsStreamTrackObject.getOutputStream().close();
+        } catch (Exception e) {
+            logger.error("Failed closing output stream", e);
+        }
 
         //Upload the Raw Audio file to S3
         if ((saveCallRecording.isPresent() ? saveCallRecording.get() : false) && (new File(kvsStreamTrackObject.getSaveAudioFilePath().toString()).length() > 0)) {
@@ -122,48 +131,121 @@ public class KVSRecordingTask {
     /**
      * Create all objects necessary for KVS streaming from each track
      *
-     * @param streamName
-     * @param startFragmentNum
      * @param trackName
      * @param contactId
      * @return
      * @throws FileNotFoundException
      */
-    private KVSStreamTrackObject getKVSStreamTrackObject(String streamName, String startFragmentNum, String trackName,
-                                                         String contactId) throws FileNotFoundException {
-        InputStream kvsInputStream = KVSUtils.getInputStreamFromKVS(streamName, REGION, startFragmentNum, getAWSCredentials(), START_SELECTOR_TYPE);
-        StreamingMkvReader streamingMkvReader = StreamingMkvReader.createDefault(new InputStreamParserByteSource(kvsInputStream));
-
-        FragmentMetadataVisitor.BasicMkvTagProcessor tagProcessor = new FragmentMetadataVisitor.BasicMkvTagProcessor();
-        FragmentMetadataVisitor fragmentVisitor = FragmentMetadataVisitor.create(Optional.of(tagProcessor));
+    private KVSStreamTrackObject getKVSStreamTrackObject(String trackName, String contactId) throws FileNotFoundException {
 
         String fileName = String.format("%s_%s_%s.raw", contactId, DATE_FORMAT.format(new Date()), trackName);
         Path saveAudioFilePath = Paths.get("/tmp", fileName);
         FileOutputStream fileOutputStream = new FileOutputStream(saveAudioFilePath.toString());
 
-        return new KVSStreamTrackObject(kvsInputStream, streamingMkvReader, tagProcessor, fragmentVisitor, saveAudioFilePath, fileOutputStream, trackName);
+        return new KVSStreamTrackObject(saveAudioFilePath, fileOutputStream, trackName);
+    }
+
+
+
+    private void startStreamingInternal(Map<String, KVSStreamTrackObject> mapping, String streamName, String fragmentNumber, String contactId) {
+        InputStream kvsInputStream = KVSUtils.getInputStreamFromKVS(streamName, REGION, fragmentNumber, getAWSCredentials(), START_SELECTOR_TYPE);
+        try {
+            StreamingMkvReader streamingMkvReader = StreamingMkvReader.createDefault(new InputStreamParserByteSource(kvsInputStream));
+            FragmentMetadataVisitor.BasicMkvTagProcessor tagProcessor = new FragmentMetadataVisitor.BasicMkvTagProcessor();
+            FragmentMetadataVisitor fragmentVisitor = FragmentMetadataVisitor.create(Optional.of(tagProcessor));
+
+            while (streamingMkvReader.mightHaveNext()) {
+                Optional<MkvElement> mkvElementOptional = streamingMkvReader.nextIfAvailable();
+                if (!mkvElementOptional.isPresent()) {
+                    continue;
+                }
+
+                MkvElement mkvElement = (MkvElement) mkvElementOptional.get();
+                try {
+                    mkvElement.accept(fragmentVisitor);
+                } catch (MkvElementVisitException e) {
+                    logger.error("BasicMkvTagProcessor failed to accept mkvElement", e);
+                }
+                if (MkvTypeInfos.EBML.equals(mkvElement.getElementMetaData().getTypeInfo())) {
+                    if (!(mkvElement instanceof MkvStartMasterElement)) {
+                        continue;
+                    }
+
+                    Optional<String> contactIdFromStream = getContactIdFromStreamTag(tagProcessor);
+                    if (contactIdFromStream.isPresent() && !contactIdFromStream.get().equals(contactId)) {
+                        continue;
+                    }
+
+                    tagProcessor.clear();
+                    continue;
+                }
+
+                if (!MkvTypeInfos.SIMPLEBLOCK.equals(mkvElement.getElementMetaData().getTypeInfo())) {
+                    continue;
+                }
+
+                MkvDataElement dataElement = (MkvDataElement) mkvElement;
+                Frame frame = (Frame) dataElement.getValueCopy().getVal();
+                ByteBuffer audioBuffer = frame.getFrameData();
+                long trackNumber = frame.getTrackNumber();
+                MkvTrackMetadata metadata = fragmentVisitor.getMkvTrackMetadata(trackNumber);
+
+                Optional<OutputStream> outputStream = getOutputStreamForTrackName(mapping, metadata.getTrackName(), fragmentVisitor);
+                if (!outputStream.isPresent()) {
+                    continue;
+                }
+                while (audioBuffer.remaining() > 0) {
+                    byte[] audioBytes = new byte[audioBuffer.remaining()];
+                    audioBuffer.get(audioBytes);
+
+                    try {
+                        // This can block the thread, when this stream isn't being read(flushed) and buffer is full.
+                        // Make sure all the kvs tracks in `this.kvsTrackStreams` are being flushed out.
+                        outputStream.get().write(audioBytes);
+                    } catch (IOException e) {
+                        logger.error("Failed to write to OutputStream for Track#{}", trackNumber, e);
+                    }
+                }
+            }
+        } catch (RuntimeException e) {
+            // catching them and logging them just so the exceptions doesn't get lost as this method is running in different thread.
+            logger.error("Exception in KVS streaming thread", e);
+        } finally {
+            try {
+                kvsInputStream.close();
+            } catch (IOException e) {
+                logger.error("Failed closing KVS input stream", e);
+            }
+        }
+    }
+
+    private Optional<OutputStream> getOutputStreamForTrackName(Map<String, KVSStreamTrackObject> mapping, String trackName, FragmentMetadataVisitor fragmentVisitor) {
+        KVSStreamTrackObject kvsStreamTrackObject = mapping.get(trackName);
+        if (kvsStreamTrackObject != null) {
+            return Optional.of(kvsStreamTrackObject.getOutputStream());
+        }
+        return Optional.empty();
     }
 
 
     /**
-     * Write the kvs stream to the output buffer
-     *
-     * @param kvsStreamTrackObject
-     * @param contactId
-     * @throws Exception
+     * Extracts the contactId from the stream metadata object.
+     * @param tagProcessor
+     * @return
      */
-    private void writeAudioBytesToKvsStream(KVSStreamTrackObject kvsStreamTrackObject, String contactId) throws Exception {
+    private Optional<String> getContactIdFromStreamTag(FragmentMetadataVisitor.BasicMkvTagProcessor tagProcessor) {
+        Iterator iter = tagProcessor.getTags().iterator();
 
-        ByteBuffer audioBuffer = KVSUtils.getByteBufferFromStream(kvsStreamTrackObject.getStreamingMkvReader(),
-                kvsStreamTrackObject.getFragmentVisitor(), kvsStreamTrackObject.getTagProcessor(), contactId, kvsStreamTrackObject.getTrackName());
+        MkvTag tag;
+        do {
+            if (!iter.hasNext()) {
+                return Optional.empty();
+            }
 
-        while (audioBuffer.remaining() > 0) {
-            byte[] audioBytes = new byte[audioBuffer.remaining()];
-            audioBuffer.get(audioBytes);
-            kvsStreamTrackObject.getOutputStream().write(audioBytes);
-            audioBuffer = KVSUtils.getByteBufferFromStream(kvsStreamTrackObject.getStreamingMkvReader(),
-                    kvsStreamTrackObject.getFragmentVisitor(), kvsStreamTrackObject.getTagProcessor(), contactId, kvsStreamTrackObject.getTrackName());
-        }
+            tag = (MkvTag)iter.next();
+        } while(!"ContactId".equals(tag.getTagName()));
+
+        return Optional.of(tag.getTagValue());
     }
 
     /**
@@ -173,33 +255,4 @@ public class KVSRecordingTask {
         return DefaultAWSCredentialsProviderChain.getInstance();
     }
 
-
-    /**
-     * KVSAudioStreamPublisher implements audio stream publisher.
-     * It emits audio events from a KVS stream asynchronously in a separate thread
-     */
-    private static class KVSAudioStreamPublisher implements Publisher<AudioStream> {
-        private final StreamingMkvReader streamingMkvReader;
-        private String contactId;
-        private OutputStream outputStream;
-        private FragmentMetadataVisitor.BasicMkvTagProcessor tagProcessor;
-        private FragmentMetadataVisitor fragmentVisitor;
-        private String track;
-
-        private KVSAudioStreamPublisher(StreamingMkvReader streamingMkvReader, String contactId, OutputStream outputStream,
-                                        FragmentMetadataVisitor.BasicMkvTagProcessor tagProcessor, FragmentMetadataVisitor fragmentVisitor,
-                                        String track) {
-            this.streamingMkvReader = streamingMkvReader;
-            this.contactId = contactId;
-            this.outputStream = outputStream;
-            this.tagProcessor = tagProcessor;
-            this.fragmentVisitor = fragmentVisitor;
-            this.track = track;
-        }
-
-        @Override
-        public void subscribe(Subscriber<? super AudioStream> s) {
-            s.onSubscribe(new KVSByteToAudioEventSubscription(s, streamingMkvReader, contactId, outputStream, tagProcessor, fragmentVisitor, track));
-        }
-    }
 }
